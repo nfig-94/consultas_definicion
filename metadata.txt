@@ -1,0 +1,20 @@
+[general]
+name=Definition Queries
+qgisMinimumVersion=3.34
+qgisMaximumVersion=4.99
+description=Filter your layers without writing SQL: build filters with drop-downs, save several named filters per layer and switch between them in one click.
+about=Filter your layers without writing SQL: build the query with drop-downs (field, operator and the layer's real values, including checkbox lists, AND / OR and groups) and the plugin writes the SQL for you. Save several named filters per layer inside the project and switch between them from the layer's right-click menu. Use any query as a filter or as a selection, select the features visible in the map view, create a filter from the current selection, and check how many features match before applying it. Warnings catch common mistakes (misspelled values, ambiguous numbers such as 1.000, filters that keep nothing, fields that were renamed). The SQL is written for each format (GeoPackage, Shapefile, GeoJSON, FileGDB, PostGIS, CSV and more), so accents, upper/lower case, underscores, percent signs and dates filter the same everywhere. Syncs with QGIS 'Filter...' and includes Processing tools. Interface in English, Spanish and Portuguese (follows the QGIS language).
+version=1.0.0
+author=Nicolás Figueroa Arthur
+email=nfigueroa1994@gmail.com
+homepage=https://github.com/nfig-94/definition_queries
+tracker=https://github.com/nfig-94/definition_queries/issues
+repository=https://github.com/nfig-94/definition_queries
+tags=filter,query,definition query,subset,selection,attribute,sql,vector
+category=Vector
+icon=icons/icon.png
+experimental=False
+deprecated=False
+hasProcessingProvider=yes
+changelog=
+    1.0.0 - First public release.
