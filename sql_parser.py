@@ -65,7 +65,7 @@ _FLIP = {"eq": "eq", "ne": "ne", "gt": "lt", "ge": "le", "lt": "gt", "le": "ge"}
 # operator -> (is_LIKE (not ILIKE), negated)
 _LIKE = {_BO.boLike: (True, False), _BO.boNotLike: (True, True),
          _BO.boILike: (False, False), _BO.boNotILike: (False, True)}
-_NEGATIONS = {"ne", "not_in", "not_contains", "not_blank"}
+_NEGATIONS = {"ne", "not_in", "not_contains", "not_starts", "not_ends", "not_between", "not_blank"}
 
 
 # ---------------------------------------------------------------- provider SQL -> QGIS syntax
@@ -108,7 +108,9 @@ def _decode_like(value, esc):
 _ESCAPE_RX = re.compile(r"\s*ESCAPE\s*'", re.I)
 
 
-_SQLITE_DT = re.compile(r'\bdatetime\s*\(\s*("(?:[^"]|"")*")\s*\)', re.I)
+# datetime("f") (version 1.0) and datetime(substr("f", 1, 19)): the field itself
+_SQLITE_DT = re.compile(r'\bdatetime\s*\(\s*(?:substr\s*\(\s*("(?:[^"]|"")*")\s*,\s*1\s*,\s*19\s*\)'
+                        r'|("(?:[^"]|"")*"))\s*\)', re.I)
 
 
 def to_expression_syntax(sql, d):
@@ -120,8 +122,8 @@ def to_expression_syntax(sql, d):
         return sql
     segs = []   # (is_literal, text)
     for is_lit, text in _segments(sql, d):
-        if not is_lit and d == "sqlite":
-            text = _SQLITE_DT.sub(r"\1", text)
+        if not is_lit and d in ("sqlite", "virtual"):
+            text = _SQLITE_DT.sub(lambda m: m.group(1) or m.group(2), text)
         segs.append(text)
     return "".join(segs)
 
@@ -219,6 +221,11 @@ class _Ctx:
         idx = self.fields.lookupField(name)
         return sql_builder.field_kind(self.fields.at(idx)) if idx >= 0 else "any"
 
+    def allows(self, name, op):
+        """Does the builder offer this operator for this field? (e.g. no «is one of» for
+        true/false fields, no «is between» for texts)."""
+        return op in {k for k, _label in sql_builder.operators_for_kind(self.kind(name))}
+
 
 def _col(node, ctx):
     if not _is_col(node):
@@ -300,7 +307,7 @@ def _like(node, ctx, is_like, negated):
     field = _col(node.opLeft(), ctx)
     lead, trail, text = _split_pattern(node.opRight(), ctx)
     wild = lead or trail
-    if ctx.d == "sqlite":
+    if ctx.d in ("sqlite", "virtual"):
         if not is_like:
             raise _Unsupported(tr("uses ILIKE, which this format does not recognize"))
         if not wild:
@@ -317,7 +324,7 @@ def _like(node, ctx, is_like, negated):
     if lead and trail:
         op = "not_contains" if negated else "contains"
     elif negated:
-        raise _Unsupported(tr("uses «NOT LIKE» with that pattern"))
+        op = "not_starts" if trail else "not_ends"
     else:
         op = "starts" if trail else "ends"
     return {"field": field, "op": op, "value": text}
@@ -369,6 +376,9 @@ def _leaf(node, ctx):
                 if key in ("eq", "ne"):
                     return {"field": field, "op": "null" if key == "eq" else "not_null"}
                 raise _Unsupported(tr("compares with NULL using < or >"))
+            if key in ("ge", "lt") and ctx.kind(field) == "datetime":
+                # only the start of the value counts here: «2024-03-04 00:00:00» -> «2024-03-04»
+                value = sql_builder.span_text(value) or value
             return {"field": field, "op": key, "value": value}
     raise _Unsupported(_describe(node))
 
@@ -378,9 +388,22 @@ def _same_ci(a, b):
     return a.get("value", "").lower() == b.get("value", "").lower()
 
 
-def _merge_and(factors):
+def _span_clause(field, lo, hi, inside):
+    """Date-time range written by the builder -> «is on» / «is between» (inside) or
+    «is not on» / «is not between» (outside)."""
+    one = sql_builder.span_text(lo, hi)
+    if one is not None:
+        return {"field": field, "op": "eq" if inside else "ne", "value": one}
+    a, b = sql_builder.span_text(lo), sql_builder.span_end_text(hi)
+    if a is None or b is None:
+        return None
+    return {"field": field, "op": "between" if inside else "not_between", "value": a, "value2": b}
+
+
+def _merge_and(factors, ctx):
     """Within an AND chain:
        ("f" >= a AND "f" <= b)                       -> is between
+       ("f" >= a AND "f" < b)  (date-time)           -> is on / is between
        ("f" NOT LIKE v1 AND "f" NOT LIKE v2 …)        -> does not contain (Á/á variants)
        ("f" NOT LIKE 'a' AND "f" NOT LIKE 'b' …)      -> is none of (GDAL engine)
        (<negation> AND "f" IS NOT NULL)              -> the negation (already excludes nulls)"""
@@ -393,11 +416,17 @@ def _merge_and(factors):
                 if prev["op"] == "ne" and prev.get("value") == "":
                     out[-1] = ("leaf", {"field": prev["field"], "op": "not_blank"})
                 continue
+            if same and prev["op"] == "ge" and c["op"] == "lt" and ctx.kind(c["field"]) == "datetime":
+                merged = _span_clause(c["field"], prev["value"], c["value"], True)
+                if merged is not None:
+                    out[-1] = ("leaf", merged)
+                    continue
             if same and prev["op"] == "ge" and c["op"] == "le":
                 out[-1] = ("leaf", {"field": c["field"], "op": "between",
                                     "value": prev["value"], "value2": c["value"]})
                 continue
-            if same and prev["op"] == "not_contains" and c["op"] == "not_contains" and _same_ci(prev, c):
+            if same and prev["op"] == c["op"] and c["op"] in ("not_contains", "not_starts", "not_ends") \
+                    and _same_ci(prev, c):
                 continue
             if same and prev["op"] in ("ne", "not_in") and c["op"] == "ne" and c.get("value") != "" \
                     and prev.get("value") != "":
@@ -423,12 +452,33 @@ def _merge_or(parts, ctx):
                 if prev["op"] == "null" and c["op"] == "eq" and c.get("value") == "":
                     out[-1] = [("leaf", {"field": c["field"], "op": "blank"})]
                     continue
-                if ctx.d == "ogrsql" and prev["op"] in ("eq", "in") and c["op"] == "eq":
+                if prev["op"] in ("eq", "in") and c["op"] == "null" and ctx.allows(c["field"], "in"):
+                    # … OR "f" IS NULL -> <Null> in the list
+                    vals = prev.get("values") or [prev["value"]]
+                    out[-1] = [("leaf", {"field": c["field"], "op": "in", "values": vals + [sql_builder.NULL_VALUE]})]
+                    continue
+                if (ctx.d == "ogrsql" or ctx.kind(c["field"]) == "datetime") and ctx.allows(c["field"], "in") \
+                        and prev["op"] in ("eq", "in") and c["op"] == "eq":
                     vals = prev.get("values") or [prev["value"]]
                     out[-1] = [("leaf", {"field": c["field"], "op": "in", "values": vals + [c["value"]]})]
                     continue
         out.append(part)
     return out
+
+
+def _outside(sub, ctx):
+    """("f" < a OR "f" > b): what the builder writes for «is not between»; for date-times
+    ("f" < a OR "f" >= b): «is not on» / «is not between». Returns the clause or None."""
+    if len(sub) != 2 or sub[1][0] != "OR" or sub[0][1][0] != "leaf" or sub[1][1][0] != "leaf":
+        return None
+    a, b = sub[0][1][1], sub[1][1][1]
+    if a["field"] != b["field"] or a["op"] != "lt":
+        return None
+    if b["op"] == "gt" and ctx.kind(a["field"]) != "datetime" and ctx.allows(a["field"], "not_between"):
+        return {"field": a["field"], "op": "not_between", "value": a["value"], "value2": b["value"]}
+    if b["op"] == "ge" and ctx.kind(a["field"]) == "datetime":
+        return _span_clause(a["field"], a["value"], b["value"], False)
+    return None
 
 
 def _terms(node, ctx):
@@ -439,13 +489,16 @@ def _terms(node, ctx):
         for f in _flatten(or_part, _BO.boAnd):
             if isinstance(f, B) and f.op() == _BO.boOr:
                 sub = _terms(f, ctx)
+                out_clause = _outside(sub, ctx)
                 if len(sub) == 1 and sub[0][1][0] == "leaf":
                     factors.append(sub[0][1])      # e.g. the Á/á variants of «contains»
+                elif out_clause is not None:
+                    factors.append(("leaf", out_clause))
                 else:
                     factors.append(("group", sub))
             else:
                 factors.append(("leaf", _leaf(f, ctx)))
-        parts.append(_merge_and(factors))
+        parts.append(_merge_and(factors, ctx))
     terms = []
     for i, part in enumerate(_merge_or(parts, ctx)):
         for j, fac in enumerate(part):
@@ -491,13 +544,18 @@ def parse(sql, layer, allow_missing=False):
     if not out:
         return None, tr("there are no conditions")
     for c in out:
-        if c.get("op") in ("eq", "ne") and c.get("value") == "":
-            if c["op"] == "eq":
-                # «= ''» leaves out nulls; «is blank» includes them: not the same thing
-                return None, tr("compares with an empty text ('')")
+        if c.get("op") == "eq" and c.get("value") == "":
+            c["value"] = sql_builder.EMPTY_VALUE     # «= ''» -> <Empty>
+        elif c.get("op") == "ne" and c.get("value") == "":
             # «<> ''» already excludes nulls (a comparison with NULL never holds): = «is not blank»
             c["op"] = "not_blank"
             c.pop("value", None)
+        elif c.get("op") in ("in", "not_in"):
+            c["values"] = [sql_builder.EMPTY_VALUE if v == "" else v for v in c.get("values") or []]
+    for c in out:
+        if not ctx.allows(c["field"], c["op"]):
+            return None, tr("uses «{}» on the field «{}», which the builder does not offer for its type").format(
+                sql_builder.OP_BY_KEY[c["op"]][1], c["field"])
     try:
         sql_builder.build_sql(out, layer, "provider")
     except sql_builder.ClauseError as err:
@@ -512,7 +570,7 @@ def reason_message(reason):
     if not reason:
         return ""
     msg = reason[0].upper() + reason[1:]
-    if reason.startswith((tr("uses "), tr("compares "))):
+    if reason.startswith((tr("uses "), tr("compares "))) and "," not in reason:  # not twice «, which…»
         msg += tr(", which the builder does not support")
     return msg + "."
 

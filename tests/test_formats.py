@@ -19,7 +19,7 @@ DEFINITION_QUERIES_LANG=en shows the plugin's messages in English):
     python tests/test_formats.py [GeoPackage Shapefile ...]
 
 Without arguments every format is tested: GeoPackage, Shapefile, GeoJSON, FlatGeobuf,
-FileGDB, Excel, SpatiaLite, CSV, "Temporary layer" and PostGIS. PostGIS is only tested
+FileGDB, Excel, SpatiaLite, CSV, "Temporary layer", "Virtual layer" and PostGIS. PostGIS is only tested
 when the environment variable DQ_PG_URI holds a QGIS postgres data source URI for a table
 with the same data (e.g. loaded from tests/data/tricky.gpkg with ogr2ogr), such as
 
@@ -53,7 +53,7 @@ DATA = os.path.join(HERE, "data")
 RESULTS = os.path.join(HERE, "results.json")
 PG_URI = os.environ.get("DQ_PG_URI", "").strip()
 FORMATS = ("GeoPackage", "Shapefile", "GeoJSON", "FlatGeobuf", "FileGDB", "Excel", "SpatiaLite", "CSV",
-           "Temporary layer", "PostGIS")
+           "Temporary layer", "Virtual layer", "PostGIS")
 ONLY = sys.argv[1:]  # optional: names of the formats to test
 # The field names of the test data are in Spanish: TEXTO = text, ENTERO = integer,
 # REAL = real, FECHA = date, FECHAHORA = date-time, BOOL = boolean (see make_data.py).
@@ -78,6 +78,9 @@ def layers():
     # temporary (memory) layer: an in-memory copy of the GeoPackage layer
     g = QgsVectorLayer(gpkg, "g", "ogr")
     out["Temporary layer"] = g.materialize(QgsFeatureRequest()) if g.isValid() else g
+    # virtual layer (SQL query over the GeoPackage layer)
+    out["Virtual layer"] = QgsVectorLayer("?layer=ogr:{}:tricky:UTF-8&query=SELECT * FROM tricky".format(
+        os.path.join(DATA, "tricky.gpkg")), "virtual", "virtual")
     if not ONLY or "PostGIS" in ONLY:
         if PG_URI:
             out["PostGIS"] = QgsVectorLayer(PG_URI, "pg", "postgres")
@@ -124,10 +127,27 @@ def to_dt(x):
     return datetime.datetime.combine(d, t)
 
 
+def dt_span(x):
+    """What a date-time value means: a date alone = the whole day, HH:MM = that minute,
+    HH:MM:SS = that second. Returns [start, end)."""
+    parts = re.split(r"[ T]+", str(x).strip(), maxsplit=1)
+    d = to_date(parts[0])
+    start = datetime.datetime(d.year, d.month, d.day)
+    if len(parts) == 1 or not parts[1]:
+        return start, start + datetime.timedelta(days=1)
+    hms = parts[1].split(":")
+    start = start.replace(hour=int(hms[0]), minute=int(hms[1]), second=int(hms[2][:2]) if len(hms) > 2 else 0)
+    return start, start + (datetime.timedelta(seconds=1) if len(hms) > 2 else datetime.timedelta(minutes=1))
+
+
 def truth(c, v, kind, ftype):
     """INTENDED semantics (what the user expects from each operator)."""
     op = c["op"]
-    NUL = sb.NULL_VALUE  # <Null> picked from a value list
+    NUL, EMP = sb.NULL_VALUE, sb.EMPTY_VALUE  # <Null> / <Empty> picked from a value list
+    if op in ("eq", "ne") and c.get("value") == EMP:
+        return v is not None and ((v == "") == (op == "eq"))
+    if op in ("in", "not_in") and EMP in (c.get("values") or []):
+        return truth(dict(c, values=["" if x == EMP else x for x in c["values"]]), v, kind, ftype)
     if op in ("eq", "ne") and c.get("value") == NUL:
         return (v is None) == (op == "eq")
     if op in ("in", "not_in") and NUL in (c.get("values") or []):
@@ -162,8 +182,12 @@ def truth(c, v, kind, ftype):
             return lx not in lv
         if op == "starts":
             return lv.startswith(lx)
+        if op == "not_starts":
+            return not lv.startswith(lx)
         if op == "ends":
             return lv.endswith(lx)
+        if op == "not_ends":
+            return not lv.endswith(lx)
     if kind == "bool":
         # "verdadero", "sí", "si" = Spanish for "true" (the cases only use "true" and "false")
         want = str(c.get("value")).strip().lower() in ("true", "verdadero", "1", "sí", "si")
@@ -171,6 +195,19 @@ def truth(c, v, kind, ftype):
             return bool(v) == want
         if op == "ne":
             return bool(v) != want
+    if kind == "datetime" and isinstance(v, datetime.datetime):
+        def inside(x):
+            a, b = dt_span(x)
+            return a <= v < b
+        if op == "in":
+            return any(inside(x) for x in c["values"])
+        if op == "not_in":
+            return not any(inside(x) for x in c["values"])
+        if op in ("between", "not_between"):
+            within = dt_span(c["value"])[0] <= v < dt_span(c["value2"])[1]
+            return within if op == "between" else not within
+        a, b = dt_span(c["value"])
+        return {"eq": a <= v < b, "ne": not a <= v < b, "gt": v >= b, "ge": v >= a, "lt": v < a, "le": v < b}[op]
     if kind in ("num", "date", "datetime", "time"):
         if isinstance(v, datetime.datetime):
             conv = to_dt
@@ -184,6 +221,8 @@ def truth(c, v, kind, ftype):
             return v not in {conv(x) for x in c["values"]}
         if op == "between":
             return conv(c["value"]) <= v <= conv(c["value2"])
+        if op == "not_between":
+            return not (conv(c["value"]) <= v <= conv(c["value2"]))
         x = conv(c["value"])
         return {"eq": v == x, "ne": v != x, "gt": v > x, "ge": v >= x, "lt": v < x, "le": v <= x}[op]
     raise ValueError((op, kind))
@@ -237,7 +276,8 @@ def single_cases(kinds_canon):
         cases.append([{"field": T, "op": "eq", "value": v}])
     for v in ["Vega", "COD_1", "a\\b", ""]:
         cases.append([{"field": T, "op": "ne", "value": v}])
-    for vs in [["Vega", "Pajonal"], ["O'Higgins", "50%", "COD_1"], ["a\\b", "Ñandú", "Güiña"]]:
+    for vs in [["Vega", "Pajonal"], ["O'Higgins", "50%", "COD_1"], ["a\\b", "Ñandú", "Güiña"], ["50%", "500"],
+               ["500", "Vega", "vega"]]:
         cases.append([{"field": T, "op": "in", "values": vs}])
         cases.append([{"field": T, "op": "not_in", "values": vs}])
     for v in ["vega", "VEGA", "árbol", "ÁRBOL", "Árbol", "arbol", "ñandú", "ÑANDÚ", "güiña", "COD_1", "cod_1", "_",
@@ -248,8 +288,17 @@ def single_cases(kinds_canon):
         cases.append([{"field": T, "op": "not_contains", "value": v}])
     for v in ["vega", "ÁRBOL", "cod_", "ñ", " ", "50%"]:
         cases.append([{"field": T, "op": "starts", "value": v}])
+    for v in ["vega", "ÁRBOL", "cod_", "ñ", " "]:
+        cases.append([{"field": T, "op": "not_starts", "value": v}])
     for v in ["nativo", "NATIVO", "_1", "%", "Ú", "\\b"]:
         cases.append([{"field": T, "op": "ends", "value": v}])
+    for v in ["nativo", "_1", "%", "Ú"]:
+        cases.append([{"field": T, "op": "not_ends", "value": v}])
+    # <Empty> (a text with nothing written) picked from the value lists
+    E = sb.EMPTY_VALUE
+    cases += [[{"field": T, "op": "eq", "value": E}], [{"field": T, "op": "ne", "value": E}],
+              [{"field": T, "op": "in", "values": ["Vega", E]}], [{"field": T, "op": "not_in", "values": ["Vega", E]}],
+              [{"field": T, "op": "in", "values": [E, sb.NULL_VALUE]}]]
     cases += [[{"field": T, "op": "null"}], [{"field": T, "op": "not_null"}],
               [{"field": T, "op": "blank"}], [{"field": T, "op": "not_blank"}]]
     # <Null> picked from the value lists (text, integer, real and date fields)
@@ -263,14 +312,21 @@ def single_cases(kinds_canon):
             for v in vals[:2]:
                 cases.append([{"field": f, "op": op, "value": v}])
         cases.append([{"field": f, "op": "between", "value": vals[1], "value2": vals[3]}])
+        cases.append([{"field": f, "op": "not_between", "value": vals[1], "value2": vals[3]}])
         cases.append([{"field": f, "op": "in", "values": vals[:3]}])
         cases.append([{"field": f, "op": "not_in", "values": vals[:3]}])
         cases += [[{"field": f, "op": "null"}], [{"field": f, "op": "not_null"}]]
-    for op, v in (("eq", "2025-03-03"), ("eq", "03-03-2025"), ("ne", "2025-03-03"), ("gt", "2024-06-15"),
-                  ("ge", "2024-11-11"), ("lt", "2023-05-06"), ("le", "11/11/2024")):
-        cases.append([{"field": "FECHA", "op": op, "value": v}])
+    if kinds_canon.get("FECHA") in ("date", "datetime"):
+        for op, v in (("eq", "2025-03-03"), ("eq", "03-03-2025"), ("ne", "2025-03-03"), ("gt", "2024-06-15"),
+                      ("ge", "2024-11-11"), ("lt", "2023-05-06"), ("le", "11/11/2024")):
+            cases.append([{"field": "FECHA", "op": op, "value": v}])
+        cases.append([{"field": "FECHA", "op": "between", "value": "2023-06-01", "value2": "2024-02-29"}])
+        cases.append([{"field": "FECHA", "op": "not_between", "value": "2023-06-01", "value2": "2024-02-29"}])
+    else:
+        # e.g. virtual layers, which expose dates as text: text rules apply
+        for op, v in (("eq", "2025-03-03"), ("ne", "2025-03-03"), ("starts", "2024-")):
+            cases.append([{"field": "FECHA", "op": op, "value": v}])
     cases.append([{"field": "FECHA", "op": "in", "values": ["2025-03-03", "2024-11-11"]}])
-    cases.append([{"field": "FECHA", "op": "between", "value": "2023-06-01", "value2": "2024-02-29"}])
     cases += [[{"field": "FECHA", "op": "null"}], [{"field": "FECHA", "op": "not_null"}]]
     if kinds_canon.get("FECHAHORA") == "datetime":
         for op, v in (("ge", "2024-03-02 10:00:00"), ("lt", "2024-02-02 00:00:00"), ("gt", "2024-04-03 05:07:00"),
@@ -278,6 +334,16 @@ def single_cases(kinds_canon):
                       ("ge", "2024-03-03")):
             cases.append([{"field": "FECHAHORA", "op": op, "value": v}])
         cases.append([{"field": "FECHAHORA", "op": "between", "value": "2024-02-01 00:00:00", "value2": "2024-03-03 23:59:59"}])
+        cases.append([{"field": "FECHAHORA", "op": "not_between", "value": "2024-02-01 00:00:00", "value2": "2024-03-03 23:59:59"}])
+        # a date alone means the whole day; HH:MM the whole minute
+        for op in ("eq", "ne", "gt", "ge", "lt", "le"):
+            cases.append([{"field": "FECHAHORA", "op": op, "value": "2024-03-03"}])
+        cases.append([{"field": "FECHAHORA", "op": "eq", "value": "03/03/2024 10:14"}])
+        cases.append([{"field": "FECHAHORA", "op": "between", "value": "2024-02-01", "value2": "2024-03-03"}])
+        cases.append([{"field": "FECHAHORA", "op": "not_between", "value": "2024-02-01", "value2": "2024-03-03"}])
+        cases.append([{"field": "FECHAHORA", "op": "in", "values": ["2024-03-03", "2024-04-01 15:21:00"]}])
+        cases.append([{"field": "FECHAHORA", "op": "not_in", "values": ["2024-03-03", "2024-04-01 15:21:00"]}])
+        cases.append([{"field": "FECHAHORA", "op": "in", "values": ["2024-03-03", sb.NULL_VALUE]}])
         cases += [[{"field": "FECHAHORA", "op": "null"}]]
     if kinds_canon.get("BOOL") == "bool":
         for v in ("true", "false"):

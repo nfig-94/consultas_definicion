@@ -135,6 +135,11 @@ class ApplySql(_Base):
         layer = self._layer(parameters, context)
         sql = self.parameterAsString(parameters, "WHERE", context).strip()
         name = self.parameterAsString(parameters, "NAME", context).strip()
+        err = store.check_fields(layer, sql)
+        if err:
+            # e.g. in GeoPackage an unknown quoted field is read as a text: the filter would
+            # silently keep nothing
+            raise QgsProcessingException(err)
         data = store.load(layer)
         if name:
             q = store.find(data, name=name)

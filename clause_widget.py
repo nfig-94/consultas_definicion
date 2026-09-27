@@ -2,6 +2,7 @@
 """Visual builder row:  [AND/OR] [Field ▼] [Operator ▼] [Value ▼] [×]"""
 
 from qgis.PyQt.QtCore import QEvent, Qt, QTimer, pyqtSignal
+from qgis.PyQt.QtGui import QBrush, QColor, QFont
 from qgis.PyQt.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -32,6 +33,13 @@ QFrame#valueChip { background: palette(alternate-base); border: 1px solid palett
 QFrame#valueChip QToolButton { border: none; padding: 0px; }
 """
 CHIP_MAX_CHARS = 60
+
+
+def _special_style():
+    """Italic grey for <Null> / <Empty>, so they are not mistaken for a text that reads the same."""
+    font = QFont()
+    font.setItalic(True)
+    return font, QBrush(QColor("#6b6b6b"))
 
 
 def _value_combo(parent):
@@ -111,6 +119,10 @@ class ValueChecklistMenu(QMenu):
     def _add_item(self, value, checked):
         it = QListWidgetItem(sql_builder.display_value(value))
         it.setData(Qt.ItemDataRole.UserRole, value)
+        if value in sql_builder.SPECIAL_VALUES:
+            font, brush = _special_style()
+            it.setFont(font)
+            it.setForeground(brush)
         # no ItemIsUserCheckable: a click anywhere on the row toggles it
         it.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
         it.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
@@ -149,16 +161,19 @@ class ValueChecklistMenu(QMenu):
         self._emit()
 
     def _enter(self):
+        """Enter in the search box checks the value typed: the exact one if it is in the list,
+        else the only one that differs just in upper/lower case, else it is added as typed."""
         text = self.search.text().strip()
         if not text:
             return
-        for i in range(self.list.count()):
-            it = self.list.item(i)
-            if it.text().lower() == text.lower():
-                it.setCheckState(Qt.CheckState.Checked)
-                break
+        value = sql_builder.stored_value(text)
+        items = [self.list.item(i) for i in range(self.list.count())]
+        exact = [it for it in items if it.data(Qt.ItemDataRole.UserRole) == value]
+        loose = [it for it in items if it.text().lower() == text.lower()]
+        if exact or len(loose) == 1:
+            (exact or loose)[0].setCheckState(Qt.CheckState.Checked)
         else:
-            self._add_item(text, True)
+            self._add_item(value, True)
         self.search.clear()
         self._emit()
 
@@ -358,28 +373,88 @@ class ClauseWidget(QFrame):
         self._loaded_field = None
         if not from_missing:  # values are kept when fixing a missing field
             self._list_values = []
+            for cb in (self.value1, self.value_a, self.value_b):  # another field: other values
+                cb.blockSignals(True)
+                cb.setEditText("")
+                cb.blockSignals(False)
         self._on_op_changed()
 
     def _ensure_values(self):
         name = self.field.currentField()
-        if not name or self._loaded_field == name:
+        with_null = self.op.currentData() in ("eq", "ne")  # <Null> / <Empty> only make sense there
+        key = (name, with_null)
+        if not name or self._loaded_field == key:
             return
-        self._loaded_field = name
+        self._loaded_field = key
         vals = self.values_provider(name)
         for cb in (self.value1, self.value_a, self.value_b):
+            keep_special = with_null and cb is self.value1
+            current = self._current_value(cb)
             txt = cb.currentText()
             cb.blockSignals(True)
             cb.clear()
-            cb.addItems([sql_builder.display_value(v) for v in vals])
-            cb.setEditText(txt)
+            for v in vals:
+                if v not in sql_builder.SPECIAL_VALUES or keep_special:
+                    self._add_combo_item(cb, v)
+            if current in sql_builder.SPECIAL_VALUES and not keep_special:
+                cb.setEditText("")
+            elif current not in (None, ""):
+                self._show_value(cb, current)   # the same item: a text «<Null>» stays a text
+            else:
+                cb.setEditText(txt)
             cb.blockSignals(False)
+
+    @staticmethod
+    def _add_combo_item(cb, value):
+        cb.addItem(sql_builder.display_value(value), value)
+        if value in sql_builder.SPECIAL_VALUES:
+            font, brush = _special_style()
+            cb.setItemData(cb.count() - 1, font, Qt.ItemDataRole.FontRole)
+            cb.setItemData(cb.count() - 1, brush, Qt.ItemDataRole.ForegroundRole)
+
+    def _show_value(self, cb, value):
+        """Shows a saved value in a box: as its list item when there is one. A value whose text
+        alone would be read as something else (a real text «<Null>» not in the list) gets an
+        extra item carrying it; any other value is shown as typed text."""
+        i = cb.findData(value) if value not in (None, "") else -1
+        if i < 0 and value not in (None, "") and \
+                sql_builder.stored_value(sql_builder.display_value(value)) != value:
+            self._add_combo_item(cb, value)
+            i = cb.count() - 1
+        if i >= 0:
+            cb.setCurrentIndex(i)
+        else:
+            cb.setEditText(sql_builder.display_value(value or ""))
+
+    @staticmethod
+    def _current_value(cb):
+        """The chosen value: the item's data when an item is shown (so <Null> is never
+        confused with a text that reads «<Null>»), otherwise what was typed."""
+        txt = cb.currentText()
+        i = cb.currentIndex()
+        if i >= 0 and cb.itemText(i) == txt and cb.itemData(i) is not None:
+            return cb.itemData(i)
+        return sql_builder.stored_value(txt)
 
     def _on_op_changed(self, *_):
         key = self.op.currentData()
         vtype = sql_builder.OP_BY_KEY.get(key, (None, None, "one"))[2]
         page = {"none": 0, "one": 1, "two": 2, "list": 3}[vtype]
+        single = self._current_value(self.value1)
+        if key not in ("eq", "ne") and single in sql_builder.SPECIAL_VALUES:
+            # <Null> / <Empty> only go with «is equal to» / «is not equal to» (or in a list)
+            self.value1.blockSignals(True)
+            self.value1.setEditText("")
+            self.value1.blockSignals(False)
+        if page == 3 and not self._list_values and single not in (None, ""):
+            self._list_values = [single]          # «is equal to X» -> «is one of» starts with X
+        elif page == 1 and len(self._list_values) == 1 and not self.value1.currentText().strip() \
+                and (key in ("eq", "ne") or self._list_values[0] not in sql_builder.SPECIAL_VALUES):
+            self.value1.blockSignals(True)
+            self._show_value(self.value1, self._list_values[0])
+            self.value1.blockSignals(False)
         self.value_stack.setCurrentIndex(page)
-        if page in (1, 2) and key not in ("contains", "not_contains", "starts", "ends"):
+        if page in (1, 2):
             self._ensure_values()
         self._refresh_list_btn()
         self.changed.emit()
@@ -450,8 +525,8 @@ class ClauseWidget(QFrame):
             "connector": self.connector.currentData(),
             "field": self.field.currentField() or (self._missing or ""),
             "op": self.op.currentData(),
-            "value": (self.value_a.currentText() if self.op.currentData() == "between"
-                      else sql_builder.stored_value(self.value1.currentText())),
+            "value": (self.value_a.currentText() if self.op.currentData() in ("between", "not_between")
+                      else self._current_value(self.value1)),
             "value2": self.value_b.currentText(),
             "values": list(self._list_values),
             "groups": list(self.groups),
@@ -478,9 +553,9 @@ class ClauseWidget(QFrame):
         if i >= 0:
             self.op.setCurrentIndex(i)
         self._list_values = list(c.get("values") or [])
-        if c.get("op") == "between":
+        if c.get("op") in ("between", "not_between"):
             self.value_a.setEditText(c.get("value", "") or "")
         else:
-            self.value1.setEditText(sql_builder.display_value(c.get("value", "") or ""))
+            self._show_value(self.value1, c.get("value", "") or "")
         self.value_b.setEditText(c.get("value2", "") or "")
         self._refresh_list_btn()

@@ -11,16 +11,19 @@ Stored structure (JSON):
                   "clauses": [...], "sql": str, "expression": str}]}
 """
 
+import collections
 import datetime
 import html
 import json
 import re
 import uuid
+import zlib
 
 from qgis.core import (
     Qgis,
     QgsCoordinateTransform,
     QgsCsException,
+    QgsDataSourceUri,
     QgsExpressionContextUtils,
     QgsGeometry,
     QgsLayerNotesUtils,
@@ -28,10 +31,13 @@ from qgis.core import (
     QgsExpression,
     QgsFeatureRequest,
     QgsProject,
+    QgsProviderRegistry,
     QgsRenderContext,
     QgsVectorLayer,
+    QgsVectorLayerTemporalContext,
 )
 
+from . import lint
 from . import sql_builder
 from . import sql_parser
 from .i18n import tr
@@ -75,6 +81,81 @@ def empty_data():
     return {"version": 1, "active": None, "queries": []}
 
 
+def _text(v):
+    if v is None or isinstance(v, (dict, list)):
+        return ""
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    return v if isinstance(v, str) else str(v)
+
+
+def _clean_clause(c):
+    """A clause with the expected types (projects edited by hand, JSON made elsewhere…)."""
+    if not isinstance(c, dict):
+        return None
+    out = dict(c)
+    out["connector"] = "OR" if str(c.get("connector", "AND")).upper() == "OR" else "AND"
+    out["field"] = _text(c.get("field"))
+    op = c.get("op")
+    out["op"] = op if isinstance(op, str) and op in sql_builder.OP_BY_KEY else "eq"
+    out["value"] = _text(c.get("value"))
+    out["value2"] = _text(c.get("value2"))
+    values = c.get("values")
+    out["values"] = [_text(v) for v in values] if isinstance(values, list) else []
+    groups = sql_builder.clause_path(c) if isinstance(c.get("groups", []), list) else []
+    out["groups"] = [g for g in groups if isinstance(g, int) and not isinstance(g, bool)]
+    out.pop("group", None)
+    return out
+
+
+def _stable_id(*parts):
+    """Same id on every load for a query that came without one (so it can be found again)."""
+    return "{:08x}".format(zlib.crc32(json.dumps(parts, sort_keys=True, default=str).encode("utf-8")))
+
+
+def _clean_query(q, position=0):
+    if not isinstance(q, dict):
+        return None
+    out = dict(q)
+    out["id"] = _text(q.get("id"))
+    out["name"] = _text(q.get("name")).strip() or tr("Query")
+    out["mode"] = "sql" if q.get("mode") == "sql" else "builder"
+    clauses = q.get("clauses")
+    out["clauses"] = [c for c in map(_clean_clause, clauses if isinstance(clauses, list) else []) if c]
+    out["sql"] = _text(q.get("sql"))
+    out["expression"] = _text(q.get("expression"))
+    return out
+
+
+def clean_data(data):
+    """Saved data with the expected structure; anything unusable is dropped."""
+    if not isinstance(data, dict):
+        return empty_data()
+    out = dict(data)
+    queries = data.get("queries")
+    out["queries"] = []
+    items = [(pos, _clean_query(raw, pos), raw) for pos, raw in enumerate(queries if isinstance(queries, list) else [])]
+    given = {q["id"] for _pos, q, _raw in items if q is not None and q["id"]}
+    seen = set()
+    for position, q, raw in items:
+        if q is None:
+            continue
+        if not q["id"] or q["id"] in seen:
+            # missing or repeated id: a new one, the same on every load, taken by nobody else
+            n = 0
+            while True:
+                candidate = _stable_id(raw, position, n)
+                if candidate not in given and candidate not in seen:
+                    break
+                n += 1
+            q["id"] = candidate
+        seen.add(q["id"])
+        out["queries"].append(q)
+    active = data.get("active")
+    out["active"] = active if isinstance(active, str) and active in seen else None
+    return out
+
+
 def load(layer):
     if layer is None:
         return empty_data()
@@ -90,9 +171,7 @@ def load(layer):
         data = json.loads(raw)
     except (TypeError, ValueError):
         return empty_data()
-    data.setdefault("active", None)
-    data.setdefault("queries", [])
-    return data
+    return clean_data(data)
 
 
 def save(layer, data, dirty=True):
@@ -178,20 +257,48 @@ def unfiltered_clone(layer):
 VALUES_LIMIT = 5000
 
 
+def _exact_unique(src, idx, limit):
+    """Distinct values read feature by feature. For decimal fields GDAL's own list (GeoJSON,
+    FlatGeobuf…) rounds them to 15 digits (0.3333333333333333 becomes 0.333333333333333),
+    and a value picked from such a list would match nothing."""
+    req = QgsFeatureRequest().setFlags(_no_geometry_flag()).setSubsetOfAttributes([idx])
+    seen, out = set(), []
+    for f in src.getFeatures(req):
+        v = f.attribute(idx)
+        key = None if sql_builder.is_null(v) else v
+        if key not in seen:
+            seen.add(key)
+            out.append(v)
+            if len(out) >= limit:
+                break
+    return out
+
+
 def unique_values(layer, field_name, clone=None, limit=VALUES_LIMIT):
     src = clone or layer
     idx = src.fields().indexOf(field_name)
     if idx < 0:
         return []
-    vals = src.uniqueValues(idx, limit)
+    if sql_builder._type_id(src.fields().at(idx)) == 6 and sql_builder.dialect_of(src) == "ogrsql":
+        vals = _exact_unique(src, idx, limit)
+    else:
+        vals = src.uniqueValues(idx, limit)
     out = set()
     has_null = False
+    has_empty = False
     for v in vals:
         t = sql_builder.value_to_text(v)
         if t is None:
             has_null = True
+        elif t == "":
+            has_empty = True   # shown as <Empty> instead of a blank row
         else:
             out.add(t)
+    if not has_null and len(vals) >= limit:  # truncated list: ask the data directly
+        req = QgsFeatureRequest().setFilterExpression(
+            "{} IS NULL".format(QgsExpression.quotedColumnRef(field_name)))
+        req.setFlags(_no_geometry_flag()).setNoAttributes().setLimit(1)
+        has_null = any(True for _ in src.getFeatures(req))
     kind = sql_builder.field_kind(src.fields().at(idx))
     if kind == "num":
         def key(s):
@@ -202,14 +309,41 @@ def unique_values(layer, field_name, clone=None, limit=VALUES_LIMIT):
         ordered = sorted(out, key=key)
     else:
         ordered = sorted(out, key=lambda s: s.lower())
-    return ([sql_builder.NULL_VALUE] if has_null else []) + ordered
+    return ([sql_builder.NULL_VALUE] if has_null else []) + ([sql_builder.EMPTY_VALUE] if has_empty else []) + ordered
+
+
+def geometry_column(layer):
+    """Name of the geometry column in the data source ('' if it has none or it is unknown)."""
+    try:
+        name = QgsDataSourceUri(layer.source()).geometryColumn()
+        if name or layer.providerType() != "ogr":
+            return name or ""
+        reg = QgsProviderRegistry.instance()
+        parts = reg.decodeUri("ogr", layer.source())
+        wanted = parts.get("layerName") or ""
+        for d in reg.querySublayers(parts.get("path") or layer.source()):
+            if d.providerKey() == "ogr" and (not wanted or d.name() == wanted):
+                return d.geometryColumnName() or ""
+    except Exception:  # an unreadable source: nothing to add
+        return ""
+    return ""
+
+
+def _missing_fields(layer, names):
+    """(missing, foreign) for the names a filter uses: see sql_builder.field_problems. The
+    geometry column is not a missing field («"geom" IS NOT NULL» is a valid filter)."""
+    missing, foreign = sql_builder.field_problems(layer, names)
+    if missing:
+        geom = geometry_column(layer).lower()
+        missing = [m for m in missing if not geom or m.lower() != geom]
+    return missing, foreign
 
 
 def check_fields(layer, sql):
     """Error message if the SQL uses fields that don't exist or are not from the data
     source (joined or virtual): the provider doesn't know them and, in SQLite, an unknown
     quoted field is taken as text and the filter fails SILENTLY."""
-    missing, foreign = sql_builder.field_problems(layer, sql_parser.referenced_fields(sql, layer))
+    missing, foreign = _missing_fields(layer, sql_parser.referenced_fields(sql, layer))
     if missing:
         return tr("The layer does not have the field(s): {}.").format(", ".join(missing))
     if foreign:
@@ -227,12 +361,14 @@ def broken_filter(layer):
     """If the layer's current filter uses fields that no longer exist, the provider
     returns no features without saying why. Returns an explanation, or None."""
     try:
+        if not layer.isValid():  # data source not available: QGIS already reports it
+            return None
         subset = (layer.subsetString() or "").strip()
     except RuntimeError:
         return None
     if not subset:
         return None
-    missing, _foreign = sql_builder.field_problems(layer, sql_parser.referenced_fields(subset, layer))
+    missing, _foreign = _missing_fields(layer, sql_parser.referenced_fields(subset, layer))
     if missing:
         return tr("the field(s) {} no longer exist").format(", ".join("«{}»".format(m) for m in missing))
     return None
@@ -242,13 +378,16 @@ def missing_query_fields(layer, data=None):
     """Fields used by the saved queries that the layer no longer has (sorted)."""
     data = data or load(layer)
     names = set(layer.fields().names())
-    used = set()
+    in_sql, in_clauses = set(), set()
     for q in data["queries"]:
         if q.get("mode") == "sql":
-            used.update(sql_parser.referenced_fields(q.get("sql") or "", layer))
+            in_sql.update(sql_parser.referenced_fields(q.get("sql") or "", layer))
         else:
-            used.update(c.get("field", "") for c in q.get("clauses", []) if c.get("field"))
-    return sorted(f for f in used if f and f not in names)
+            in_clauses.update(c.get("field", "") for c in q.get("clauses", []) if c.get("field"))
+    missing = {f for f in in_clauses if f not in names}
+    if in_sql:
+        missing.update(_missing_fields(layer, sorted(in_sql))[0])
+    return sorted(missing)
 
 
 def replace_field(layer, old, new):
@@ -408,6 +547,24 @@ def _stable_ids(layer):
     return False
 
 
+def _by_content(layer):
+    """Virtual layers without a key renumber their features when filtered, so rows are
+    matched by content instead. A filter only reads the row's values (and geometry), so
+    rows with identical content always get the same answer."""
+    return layer.providerType() == "virtual" and len(layer.primaryKeyAttributes()) != 1
+
+
+def _row_key(f, names):
+    values = tuple(None if sql_builder.is_null(v) else (type(v).__name__, str(v))
+                   for v in (f.attribute(n) for n in names))
+    g = f.geometry()
+    return values, (bytes(g.asWkb()) if g is not None and not g.isNull() else b"")
+
+
+def _source_names(clone):
+    return [fld.name() for fld in clone.fields()]
+
+
 def matching_ids(layer, sql, clone=None):
     """Ids of the features matching the SQL, evaluated by the SAME engine as the filter
     (so the selection always matches what the filter would show).
@@ -431,6 +588,10 @@ def matching_ids(layer, sql, clone=None):
     if _stable_ids(layer):
         req.setNoAttributes()
         ids = {f.id() for f in clone.getFeatures(req)}
+    elif _by_content(layer):
+        names = _source_names(clone)
+        keys = {_row_key(f, names) for f in clone.getFeatures(QgsFeatureRequest())}
+        ids = {f.id() for f in layer.getFeatures(QgsFeatureRequest()) if _row_key(f, names) in keys}
     else:
         pk = layer.primaryKeyAttributes()
         if len(pk) != 1:
@@ -457,11 +618,11 @@ def compare_results(layer, sql_a, sql_b, clone=None, limit=COMPARE_LIMIT):
     flag = _no_geometry_flag()
 
     def collect(features, key):
-        out = set()
+        out = collections.Counter()
         for i, f in enumerate(features):
             if i >= limit:
                 raise _TooMany()
-            out.add(key(f))
+            out[key(f)] += 1
         return out
 
     try:
@@ -480,9 +641,14 @@ def compare_results(layer, sql_a, sql_b, clone=None, limit=COMPARE_LIMIT):
             pk = [] if layer.providerType() in ("ogr", "spatialite", "delimitedtext") \
                 else list(layer.primaryKeyAttributes())
 
+            by_content = _by_content(layer)
+            names = _source_names(clone)
+
             def keys(sql):
                 if not clone.setSubsetString(sql):
                     return None
+                if by_content:
+                    return collect(clone.getFeatures(QgsFeatureRequest()), lambda f: _row_key(f, names))
                 req = QgsFeatureRequest().setFlags(flag)
                 if pk:
                     req.setSubsetOfAttributes(pk)
@@ -497,7 +663,7 @@ def compare_results(layer, sql_a, sql_b, clone=None, limit=COMPARE_LIMIT):
         return None
     if a is None or b is None:
         return None
-    return a == b, len(a), len(b)
+    return a == b, sum(a.values()), sum(b.values())
 
 
 def select_with_query(layer, qid, behavior="set"):
@@ -569,6 +735,16 @@ def visible_ids(layer, map_settings):
     ctx.expressionContext().appendScope(QgsExpressionContextUtils.layerScope(layer))
     renderer = layer.renderer().clone() if layer.renderer() is not None else None
     request = QgsFeatureRequest().setFilterRect(view.boundingBox())
+    temporal = layer.temporalProperties()
+    if map_settings.isTemporal() and temporal is not None and temporal.isActive():
+        # the Temporal Controller only draws the features of the current time
+        if not temporal.isVisibleInTemporalRange(map_settings.temporalRange()):
+            return None, tr("«{}» is not drawn at the current time (Temporal Controller).").format(layer.name())
+        tctx = QgsVectorLayerTemporalContext()
+        tctx.setLayer(layer)
+        time_filter = temporal.createFilterString(tctx, map_settings.temporalRange())
+        if time_filter:
+            request.combineFilterExpression(time_filter)
     engine = QgsGeometry.createGeometryEngine(view.constGet())
     engine.prepareGeometry()
     ids = []
@@ -698,6 +874,16 @@ def selection_to_query(layer):
             clauses.append({"field": fld.name(), "op": "between", "value": str(a), "value2": str(b),
                             "connector": "OR", "groups": []})
         warning = _large_warning(len(singles))
+        if clauses and clauses[0]["op"] == "in" and sql_builder.field_kind(fld) == "text" \
+                and sql_builder.dialect_of(layer) == "ogrsql" \
+                and sum(map(sql_builder.has_ascii_letters, clauses[0]["values"])) > sql_builder.MAX_EXACT_LIST:
+            src = unfiltered_clone(layer) or layer
+            others = [sql_builder.value_to_text(v) for v in src.uniqueValues(src.fields().lookupField(fld.name()))]
+            clash = lint.case_clash(layer, "in", clauses[0]["values"], others)
+            if clash:
+                warning = _join_warnings(warning, tr(
+                    "With more than {} values, this format does not tell upper and lower case apart: "
+                    "«{}» also counts as chosen.").format(sql_builder.MAX_EXACT_LIST, clash))
         if len(ranges) > _MAX_RANGE_CLAUSES:  # too many clauses for the builder: keep it as SQL
             return {"sql": sql_builder.build_sql(clauses, layer, "provider"),
                     "expression": sql_builder.build_sql(clauses, layer, "expression"), "warning": warning}
@@ -740,6 +926,11 @@ def selection_to_sql(layer):
 
 
 def query_from_selection(layer, name=None, activate=True):
+    if layer.isEditable():
+        if activate:
+            return None, False, tr("The layer is in edit mode: save or discard changes before filtering.")
+        if any(fid < 0 for fid in layer.selectedFeatureIds()):
+            return None, False, tr("Some selected features are new and not saved yet: their IDs are temporary. Save the layer first.")
     r = selection_to_query(layer)
     data = load(layer)
     qname = unique_name(data, name or default_name(data))
@@ -775,11 +966,11 @@ def import_json(layer, path):
     incoming = payload.get("queries", []) if isinstance(payload, dict) else payload
     data = load(layer)
     n = 0
-    for q in incoming:
+    for q in incoming if isinstance(incoming, list) else []:
         if not isinstance(q, dict) or "name" not in q:
             continue
-        nq = new_query(unique_name(data, q["name"]), q.get("mode", "builder"),
-                       q.get("clauses", []), q.get("sql", ""), q.get("expression", ""))
+        q = _clean_query(q)
+        nq = new_query(unique_name(data, q["name"]), q["mode"], q["clauses"], q["sql"], q["expression"])
         data["queries"].append(nq)
         n += 1
     save(layer, data)
@@ -821,6 +1012,8 @@ def sync_from_layer(layer, dirty=True):
     if not isinstance(layer, QgsVectorLayer):
         return False
     try:
+        if not layer.isValid():  # data source not available: leave everything as it is
+            return False
         subset = (layer.subsetString() or "").strip()
     except RuntimeError:  # layer already deleted
         return False

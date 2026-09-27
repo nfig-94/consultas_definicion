@@ -27,6 +27,16 @@ except AttributeError:
     VECTOR_TYPE = QgsMapLayerType.VectorLayer  # QGIS < 3.30
 
 
+def _menu_text(name):
+    """In menus «&» marks a keyboard shortcut: double it so names like «Asia & Europe» show as typed."""
+    return name.replace("&", "&&")
+
+
+def _short(text, limit=600):
+    """Tooltips with huge SQL (e.g. a filter by selection) are cut."""
+    return text if len(text) <= limit else text[:limit] + " …"
+
+
 class DefinitionQueriesPlugin:
     def __init__(self, iface):
         self.iface = iface
@@ -117,6 +127,8 @@ class DefinitionQueriesPlugin:
             # register them without marking the project as modified
             store.sync_from_layer(layer, dirty=False)
             store.update_layer_note(layer)  # projects saved before layer notes existed
+            if not layer.isValid():  # data source not available: QGIS already reports it
+                continue
             q, status = store.active_status(layer)
             if store.broken_filter(layer):
                 status = "broken"
@@ -136,7 +148,7 @@ class DefinitionQueriesPlugin:
             parts.append(tr("The active filter uses fields that no longer exist in: {} (the layer shows no features). "
                             "Fix it in Manage queries… → ⋯ → Replace a field in all queries.").format(", ".join(broken)))
         if pending:
-            parts.append(tr("Active queries with changes not applied in: {} (the layer still has the previous filter).").format(", ".join(pending)))
+            parts.append(tr("The active filter no longer matches its query in: {} (the query was edited, a field changed type, or the plugin was updated).").format(", ".join(pending)))
             parts.append(tr("Right-click the layer → Definition Queries → pick the query marked with ✓ to apply it again."))
         self.iface.messageBar().pushMessage(
             tr("Definition Queries"), " ".join(parts), Qgis.MessageLevel.Warning, 20)
@@ -240,7 +252,7 @@ class DefinitionQueriesPlugin:
         active, status = store.active_status(layer, data)
         subset = (layer.subsetString() or "").strip()
 
-        label = active["name"] if active else (tr("manual (not saved)") if subset else tr("none"))
+        label = _menu_text(active["name"]) if active else (tr("manual (not saved)") if subset else tr("none"))
         if status == "equivalent":
             label += tr(" — written with another syntax (pick it to rewrite it)")
         elif status == "pending":
@@ -256,10 +268,10 @@ class DefinitionQueriesPlugin:
         a_all.triggered.connect(lambda _=False, lyr=layer: self.activate(lyr, None))
         for q in data["queries"]:
             is_active = active is not None and active["id"] == q["id"]
-            a = m.addAction(check if is_active else blank, q["name"])
+            a = m.addAction(check if is_active else blank, _menu_text(q["name"]))
             a.setProperty("activa", is_active)
             try:
-                a.setToolTip(store.query_sql(layer, q))
+                a.setToolTip(_short(store.query_sql(layer, q)))
             except sql_builder.ClauseError:
                 pass
             a.triggered.connect(lambda _=False, lyr=layer, i=q["id"]: self.activate(lyr, i))
@@ -269,7 +281,7 @@ class DefinitionQueriesPlugin:
             sm = m.addMenu(QgsApplication.getThemeIcon("/mIconExpressionSelect.svg"),
                            tr("Select features with…"))
             for q in data["queries"]:
-                a = sm.addAction(q["name"])
+                a = sm.addAction(_menu_text(q["name"]))
                 a.triggered.connect(lambda _=False, lyr=layer, i=q["id"]: self.select(lyr, i))
 
         m.addSeparator()

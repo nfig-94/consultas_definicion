@@ -1009,6 +1009,11 @@ class QueryManagerDialog(QDialog):
             warns = lint(clauses, self.layer, self.values_for, self._values_complete)
         except Exception:
             warns = []
+        source = sql_builder.untested_source(self.layer)
+        if source:
+            warns.insert(0, tr("This type of data source ({}) has not been tested with the plugin: its database "
+                               "applies its own rules (e.g. upper/lower case). Check the result with Verify.")
+                         .format(source))
         self.lint_lbl.setText("\n".join("⚠ " + w for w in warns))
         self.lint_lbl.setVisible(bool(warns))
 
@@ -1078,7 +1083,7 @@ class QueryManagerDialog(QDialog):
         if it is None:
             return
         self.sql_values.clear()
-        self.sql_values.addItems([v for v in self.values_for(it.text()) if v != sql_builder.NULL_VALUE])
+        self.sql_values.addItems([v for v in self.values_for(it.text()) if v not in sql_builder.SPECIAL_VALUES])
 
     def _insert_value(self, item):
         fld = self.sql_fields.currentItem()
@@ -1130,7 +1135,9 @@ class QueryManagerDialog(QDialog):
             self.data["active"] = None
         store.save(self.layer, self.data)
         if was_active:
-            store.clear_filter(self.layer)
+            ok, msg = store.clear_filter(self.layer)
+            if not ok:
+                self._bar(False, msg)
         self.current_id = None
         self._reload_list()
 
@@ -1283,6 +1290,9 @@ class QueryManagerDialog(QDialog):
             self._bar(False, str(e))
             return
         self._loading = False
+        if q is None:
+            self._bar(False, msg)
+            return
         self.data = store.load(self.layer)
         self._reload_list(q["id"])
         self._bar(ok, msg)

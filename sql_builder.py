@@ -16,6 +16,9 @@ behaves differently (all of this was verified with tests against the data):
   postgres PostgreSQL/PostGIS           «=» exact · ILIKE · escape «\\»
   qgis     memory layers, CSV           QGIS expression engine · dates via
            (delimited text)             to_date()/to_datetime() · «\\» in strings
+  virtual  virtual layers               SQLite, but a plain «col LIKE 'x'» is handed to
+                                        QGIS, which makes it case-sensitive: every LIKE
+                                        gets an ESCAPE clause so SQLite evaluates it itself
 
 Semantics guaranteed in ALL formats:
   * «is equal to», «is one of»: exact match (case- and accent-sensitive).
@@ -42,12 +45,15 @@ OPERATORS = [
     ("contains", tr("contains the text"), "one"),
     ("not_contains", tr("does not contain the text"), "one"),
     ("starts", tr("starts with"), "one"),
+    ("not_starts", tr("does not start with"), "one"),
     ("ends", tr("ends with"), "one"),
+    ("not_ends", tr("does not end with"), "one"),
     ("gt", tr("is greater than"), "one"),
     ("ge", tr("is greater than or equal to"), "one"),
     ("lt", tr("is less than"), "one"),
     ("le", tr("is less than or equal to"), "one"),
     ("between", tr("is between"), "two"),
+    ("not_between", tr("is not between"), "two"),
     ("blank", tr("is blank (empty or null)"), "none"),
     ("not_blank", tr("is not blank"), "none"),
     ("null", tr("is null (NULL)"), "none"),
@@ -55,12 +61,15 @@ OPERATORS = [
 ]
 OP_BY_KEY = {o[0]: o for o in OPERATORS}
 
-_OPS_TEXT = ["eq", "ne", "in", "not_in", "contains", "not_contains", "starts", "ends",
+_OPS_TEXT = ["eq", "ne", "in", "not_in", "contains", "not_contains", "starts", "not_starts", "ends", "not_ends",
              "blank", "not_blank", "null", "not_null"]
-_OPS_ORDERED = ["eq", "ne", "in", "not_in", "gt", "ge", "lt", "le", "between", "null", "not_null"]
+_OPS_ORDERED = ["eq", "ne", "in", "not_in", "gt", "ge", "lt", "le", "between", "not_between", "null", "not_null"]
+# dates read better with ArcGIS-style words
+_DATE_LABELS = {"eq": tr("is on"), "ne": tr("is not on"), "gt": tr("is after"), "ge": tr("is on or after"),
+                "lt": tr("is before"), "le": tr("is on or before")}
 _OPS_BOOL = ["eq", "ne", "null", "not_null"]
 _OPS_OTHER = ["null", "not_null"]
-_LIKE_OPS = ("contains", "not_contains", "starts", "ends")
+_LIKE_OPS = ("contains", "not_contains", "starts", "not_starts", "ends", "not_ends")
 
 # OGR formats whose filter is evaluated by the database itself (native SQL)
 _OGR_SQLITE = {"GPKG", "SQLITE"}
@@ -77,7 +86,8 @@ class Incomplete(ClauseError):
 
 # ---------------------------------------------------------------- filter engine
 def dialect_of(layer):
-    """'sqlite' | 'ogrsql' | 'postgres' | 'qgis', depending on what evaluates the layer's filter."""
+    """'sqlite' | 'ogrsql' | 'postgres' | 'qgis' | 'virtual', depending on what evaluates
+    the layer's filter."""
     if layer is None:
         return "qgis"
     prov = layer.providerType()
@@ -85,6 +95,8 @@ def dialect_of(layer):
         return "qgis"
     if prov == "spatialite":
         return "sqlite"
+    if prov == "virtual":
+        return "virtual"
     if prov == "postgres":
         return "postgres"
     if prov == "ogr":
@@ -100,8 +112,32 @@ def dialect_of(layer):
     return "postgres"  # other SQL engines (MSSQL, Oracle…): standard SQL
 
 
+# Data sources covered by the tests in tests/. Any other database applies its own rules
+# (e.g. SQL Server usually ignores upper/lower case in «=»), so the dialog says so.
+_TESTED_PROVIDERS = {"ogr", "spatialite", "postgres", "delimitedtext", "memory", "virtual"}
+_OGR_DATABASES = {"MSSQLSPATIAL", "OCI", "MYSQL", "ODBC", "PGEO", "HANA", "WFS", "OAPIF", "ESRIJSON",
+                  "ELASTICSEARCH", "MONGODBV3", "CARTO", "NGW"}
+
+
+def untested_source(layer):
+    """Name of the layer's data source type if the filters were not tested on it, else ''."""
+    if layer is None:
+        return ""
+    prov = layer.providerType()
+    if prov not in _TESTED_PROVIDERS:
+        return prov
+    if prov == "ogr":
+        try:
+            storage = layer.storageType() or ""
+        except Exception:
+            storage = ""
+        if storage.upper() in _OGR_DATABASES:
+            return storage
+    return ""
+
+
 def _resolve_dialect(layer, dialect):
-    if dialect in ("sqlite", "ogrsql", "postgres", "qgis"):
+    if dialect in ("sqlite", "ogrsql", "postgres", "qgis", "virtual"):
         return dialect
     if dialect == "expression":
         return "qgis"
@@ -157,6 +193,8 @@ def operators_for_kind(kind):
         keys = _OPS_BOOL
     else:
         keys = _OPS_OTHER
+    if kind in ("date", "datetime"):
+        return [(k, _DATE_LABELS.get(k, OP_BY_KEY[k][1])) for k in keys]
     return [(k, OP_BY_KEY[k][1]) for k in keys]
 
 
@@ -182,7 +220,9 @@ def is_null(v):
     return False
 
 
-NULL_VALUE = "\u0000null"  # stored in a clause when the user picks <Null> from a value list
+NULL_VALUE = "\u0000null"    # stored in a clause when the user picks <Null> from a value list
+EMPTY_VALUE = "\u0000empty"  # ... and when the user picks <Empty> (a text with nothing written: '')
+SPECIAL_VALUES = (NULL_VALUE, EMPTY_VALUE)
 
 
 def null_label():
@@ -190,12 +230,43 @@ def null_label():
     return tr("<Null>")
 
 
+def empty_label():
+    """How an empty text ('') is shown in the value lists."""
+    return tr("<Empty>")
+
+
+EDGE_SPACE = "\u2423"   # «␣»: a space at the start or end of a value, made visible
+
+
 def display_value(value):
-    return null_label() if value == NULL_VALUE else value
+    """How a value is shown in the lists. Spaces at the start or end are shown as «␣»,
+    otherwise «Vega» and «Vega » would look the same."""
+    if value == NULL_VALUE:
+        return null_label()
+    if value == EMPTY_VALUE:
+        return empty_label()
+    if isinstance(value, str) and value != value.strip(" "):
+        core = value.strip(" ")
+        if not core:
+            return EDGE_SPACE * len(value)
+        lead = len(value) - len(value.lstrip(" "))
+        trail = len(value) - len(value.rstrip(" "))
+        return EDGE_SPACE * lead + core + EDGE_SPACE * trail
+    return value
 
 
 def stored_value(text):
-    return NULL_VALUE if text == null_label() else text
+    """Inverse of display_value, for what is typed in a value box."""
+    if text == null_label():
+        return NULL_VALUE
+    if text == empty_label():
+        return EMPTY_VALUE
+    if isinstance(text, str) and (text.startswith(EDGE_SPACE) or text.endswith(EDGE_SPACE)):
+        core = text.strip(EDGE_SPACE)
+        lead = len(text) - len(text.lstrip(EDGE_SPACE))
+        trail = len(text) - len(text.rstrip(EDGE_SPACE))
+        return " " * lead + core + " " * trail if core else " " * len(text)
+    return text
 
 
 def bool_text(value):
@@ -216,9 +287,9 @@ def value_to_text(v):
         return v.toString("HH:mm:ss")
     if isinstance(v, bool):
         return bool_text(v)
-    if isinstance(v, float) and v.is_integer():
+    if isinstance(v, float) and v.is_integer() and abs(v) < 1e15:
         return str(int(v))
-    return str(v)
+    return str(v)   # floats: the shortest text that reads back as the same number
 
 
 # ---------------------------------------------------------------- values typed by the user
@@ -226,7 +297,7 @@ _DATE_PATTERNS = [
     (re.compile(r"^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})$"), ("y", "m", "d")),
     (re.compile(r"^(\d{1,2})[-/.](\d{1,2})[-/.](\d{4})$"), ("d", "m", "y")),
 ]
-_TIME = re.compile(r"^(\d{1,2}):(\d{2})(?::(\d{2})(?:[.,]\d+)?)?$")
+_TIME = re.compile(r"^(\d{1,2}):(\d{2})(?::(\d{2})(?:[.,]\d+)?)?(?:Z|[+-]\d{2}(?::?\d{2})?)?$")
 _TRUE = {"true", "verdadero", "verdadeiro", "v", "t", "1", "si", "sí", "sim", "yes", "y"}
 _FALSE = {"false", "falso", "f", "0", "no", "n", "não", "nao"}
 
@@ -251,6 +322,84 @@ def _parse_time(text):
     if h > 23 or mi > 59 or s > 59:
         raise ClauseError(tr("«{}» is not a valid time.").format(text))
     return _dt.time(h, mi, s)
+
+
+def datetime_span(value):
+    """What a date-time value typed or picked by the user covers, as [start, end):
+    a date alone is the whole day, «HH:MM» the whole minute and «HH:MM:SS» that second.
+    So «is on 2024-03-03» finds every time of that day, and a value picked from the list
+    also finds the features whose time has milliseconds (the list shows whole seconds).
+    end is None when the span reaches the last possible moment (e.g. 9999-12-31)."""
+    text = "" if value is None else str(value).strip()
+    if text == "":
+        raise Incomplete(tr("A value is missing."))
+    parts = re.split(r"[ T]+", text, maxsplit=1)
+    d = _parse_date(parts[0])
+    start = _dt.datetime(d.year, d.month, d.day)
+    if len(parts) == 1 or not parts[1]:
+        step = _dt.timedelta(days=1)
+    else:
+        t = _parse_time(parts[1])
+        start = start.replace(hour=t.hour, minute=t.minute, second=t.second)
+        step = _dt.timedelta(minutes=1) if _TIME.match(parts[1]).group(3) is None else _dt.timedelta(seconds=1)
+    try:
+        return start, start + step
+    except OverflowError:
+        return start, None
+
+
+def datetime_text(x, precision="second"):
+    """«YYYY-MM-DD HH:MM:SS» (or shorter), with the year always in 4 digits
+    (strftime does not pad years before 1000 on every system)."""
+    day = "{:04d}-{:02d}-{:02d}".format(x.year, x.month, x.day)
+    if precision == "day":
+        return day
+    if precision == "minute":
+        return "{} {:02d}:{:02d}".format(day, x.hour, x.minute)
+    return "{} {:02d}:{:02d}:{:02d}".format(day, x.hour, x.minute, x.second)
+
+
+def _moment(text):
+    """Start of a date-time value in any accepted form, or None."""
+    try:
+        return datetime_span(text)[0]
+    except ClauseError:
+        return None
+
+
+def span_text(start, end=None):
+    """Inverse of datetime_span, for reading SQL back into the builder: the shortest value
+    whose span starts at «start» (and ends at «end», if given), or None if there is none."""
+    a = _moment(start)
+    b = _moment(end) if end is not None else None
+    if a is None or (end is not None and b is None):
+        return None
+    if end is None:
+        if a.time() == _dt.time(0, 0):
+            return datetime_text(a, "day")
+        return datetime_text(a, "minute" if a.second == 0 else "second")
+    if b - a == _dt.timedelta(days=1) and a.time() == _dt.time(0, 0):
+        return datetime_text(a, "day")
+    if b - a == _dt.timedelta(minutes=1) and a.second == 0:
+        return datetime_text(a, "minute")
+    if b - a == _dt.timedelta(seconds=1):
+        return datetime_text(a, "second")
+    return None
+
+
+def span_end_text(end):
+    """The value whose span ENDS at «end» (for the second value of «is between»)."""
+    b = _moment(end)
+    if b is None:
+        return None
+    try:
+        if b.time() == _dt.time(0, 0):
+            return datetime_text(b - _dt.timedelta(days=1), "day")
+        if b.second == 0:
+            return datetime_text(b - _dt.timedelta(minutes=1), "minute")
+        return datetime_text(b - _dt.timedelta(seconds=1), "second")
+    except OverflowError:
+        return None
 
 
 def normalize_value(value, kind):
@@ -317,7 +466,8 @@ def _quote(value, d):
     return quote_text(value)
 
 
-_ESC = {"sqlite": "\\", "postgres": "\\", "ogrsql": "!", "qgis": "\\"}
+_ESC = {"sqlite": "\\", "postgres": "\\", "ogrsql": "!", "qgis": "\\", "virtual": "\\"}
+_SQLITE = ("sqlite", "virtual")
 
 
 def _like_pattern(text, d, lead, trail):
@@ -337,6 +487,9 @@ def _like_pattern(text, d, lead, trail):
 
 
 def _escape_clause(needs, d):
+    if d == "virtual":
+        # without ESCAPE, QGIS evaluates «col LIKE 'x'» itself and it becomes case-sensitive
+        return " ESCAPE " + quote_text(_ESC[d])
     if not needs or d == "qgis":
         return ""
     return " ESCAPE " + quote_text(_ESC[d])
@@ -371,7 +524,7 @@ def _lit(canon, kind, d):
         return canon
     if kind == "bool":
         val = canon == "true"
-        if d in ("sqlite", "ogrsql"):
+        if d in ("sqlite", "ogrsql", "virtual"):
             return "1" if val else "0"
         return "TRUE" if val else "FALSE"
     if d == "qgis":
@@ -383,10 +536,68 @@ def _lit(canon, kind, d):
 
 def _fexpr(name, kind, d):
     f = quote_ident(name)
-    if d == "sqlite" and kind == "datetime":
-        # GeoPackage stores «2024-03-03T10:14:00.000»: normalize it so comparisons work
-        return "datetime({})".format(f)
+    if d in _SQLITE and kind == "datetime":
+        # GeoPackage stores «2024-03-03T10:14:00.000» (sometimes with «Z» or «-03:00»):
+        # normalize it to «2024-03-03 10:14:00», the time QGIS shows, so comparisons work
+        return "datetime(substr({}, 1, 19))".format(f)
     return f
+
+
+def _datetime_sql(op, clause, f, fx, d):
+    """Date-time conditions as ranges [start, end) (see datetime_span). A span that reaches
+    the last possible moment (9999-12-31) has no end: nothing comes after it."""
+    not_null = " AND {} IS NOT NULL".format(f)
+
+    def lit(x):
+        return _lit(datetime_text(x), "datetime", d)
+
+    def inside(a, b):
+        if b is None:
+            return "{} >= {}".format(fx, lit(a))
+        return "({fx} >= {a} AND {fx} < {b})".format(fx=fx, a=lit(a), b=lit(b))
+
+    def outside(a, b):
+        if b is None:
+            return "{} < {}".format(fx, lit(a))
+        return "({fx} < {a} OR {fx} >= {b})".format(fx=fx, a=lit(a), b=lit(b))
+
+    if op in ("in", "not_in"):
+        spans = [datetime_span(v) for v in clause.get("values") or []]
+        if op == "in":
+            items = [inside(a, b) for a, b in spans]
+            return items[0] if len(items) == 1 else "(" + " OR ".join(items) + ")"
+        return "(" + " AND ".join(outside(a, b) for a, b in spans) + not_null + ")"
+    if op in ("between", "not_between"):
+        a, b = datetime_span(clause.get("value"))[0], datetime_span(clause.get("value2"))[1]
+        if op == "between":
+            return inside(a, b)
+        return "({}{})".format(outside(a, b), not_null)
+    a, b = datetime_span(clause.get("value"))
+    if op == "eq":
+        return inside(a, b)
+    if op == "ne":
+        return "({}{})".format(outside(a, b), not_null)
+    if op == "gt":
+        return "{} >= {}".format(fx, lit(b)) if b is not None else "({} IS NULL AND {} IS NOT NULL)".format(f, f)
+    if op == "le":
+        return "{} < {}".format(fx, lit(b)) if b is not None else "{} IS NOT NULL".format(f)
+    return "{} {} {}".format(fx, ">=" if op == "ge" else "<", lit(a))
+
+
+# GDAL (Shapefile, GeoJSON…) compares texts with «=» and IN ignoring upper/lower case, but only
+# for the letters a-z: a text without them is matched exactly by IN, which is fast. Texts with
+# a-z need LIKE (exact), which GDAL evaluates slowly: one LIKE per value for every feature.
+_ASCII_LETTER = re.compile(r"[A-Za-z]")
+MAX_EXACT_LIST = 32   # above this many texts with a-z, «is one of» uses IN (lint warns if that matters)
+
+
+def has_ascii_letters(text):
+    return bool(_ASCII_LETTER.search(str(text)))
+
+
+def ascii_fold(text):
+    """Lowercase for a-z only (how GDAL compares texts with «=» and IN)."""
+    return re.sub(r"[A-Z]", lambda m: m.group(0).lower(), str(text))
 
 
 def _exact(f, value, d, negate=False):
@@ -406,16 +617,29 @@ def clause_to_sql(clause, kind, d):
     fx = _fexpr(name, kind, d)
     not_null = " AND {} IS NOT NULL".format(f)
 
-    # <Null> picked from a value list: IS NULL / IS NOT NULL
+    # <Null> / <Empty> picked from a value list
+    vtype = OP_BY_KEY.get(op, (None, None, "one"))[2]
+    for special in SPECIAL_VALUES:
+        if vtype in ("one", "two") and op not in ("eq", "ne") and special in (clause.get("value"), clause.get("value2")):
+            raise ClauseError(tr("«{}» can only be used with «is equal to», «is not equal to», «is one of» and «is none of».")
+                              .format(display_value(special)))
+    picked = [clause.get("value")] if op in ("eq", "ne") else (clause.get("values") or []) if op in ("in", "not_in") else []
+    if EMPTY_VALUE in picked and kind not in ("text", "any", "other"):
+        raise ClauseError(tr("«{}» only applies to text fields.").format(empty_label()))
     if op in ("eq", "ne") and clause.get("value") == NULL_VALUE:
         return "{} IS {}NULL".format(f, "" if op == "eq" else "NOT ")
-    if op in ("in", "not_in") and NULL_VALUE in (clause.get("values") or []):
-        rest = [v for v in clause["values"] if v != NULL_VALUE]
+    if op in ("eq", "ne") and clause.get("value") == EMPTY_VALUE:
+        if op == "eq":
+            return _exact(f, "", d)
+        return "({}{})".format(_exact(f, "", d, negate=True), not_null)
+    if op in ("in", "not_in") and any(v in SPECIAL_VALUES for v in picked):
+        with_null = NULL_VALUE in picked
+        rest = ["" if v == EMPTY_VALUE else v for v in picked if v != NULL_VALUE]
         if not rest:
             return "{} IS {}NULL".format(f, "" if op == "in" else "NOT ")
         main = clause_to_sql(dict(clause, values=rest), kind, d)
         # «is none of» already leaves empty values out
-        return "({} OR {} IS NULL)".format(main, f) if op == "in" else main
+        return "({} OR {} IS NULL)".format(main, f) if (op == "in" and with_null) else main
 
     if op == "null":
         return "{} IS NULL".format(f)
@@ -433,18 +657,27 @@ def clause_to_sql(clause, kind, d):
         if txt == "":
             raise Incomplete(tr("Type the text to search for in '{}'.").format(name))
         lead, trail = {"contains": (True, True), "not_contains": (True, True),
-                       "starts": (False, True), "ends": (True, False)}[op]
-        like = "LIKE" if d == "sqlite" else "ILIKE"
+                       "starts": (False, True), "not_starts": (False, True),
+                       "ends": (True, False), "not_ends": (True, False)}[op]
+        like = "LIKE" if d in _SQLITE else "ILIKE"
         parts = []
         for var in case_variants(txt, d):
             pat, needs = _like_pattern(var, d, lead, trail)
             parts.append((_quote(pat, d), _escape_clause(needs, d)))
-        if op == "not_contains":
+        if op in ("not_contains", "not_starts", "not_ends"):
             body = " AND ".join("{} NOT {} {}{}".format(f, like, p, e) for p, e in parts)
             return "({}{})".format(body, not_null)
         if len(parts) == 1:
             return "{} {} {}{}".format(f, like, parts[0][0], parts[0][1])
         return "(" + " OR ".join("{} {} {}{}".format(f, like, p, e) for p, e in parts) + ")"
+
+    if kind == "datetime" and op in ("eq", "ne", "gt", "ge", "lt", "le", "between", "not_between",
+                                     "in", "not_in"):
+        if op in ("in", "not_in") and not (clause.get("values") or []):
+            raise Incomplete(tr("Choose at least one value for '{}'.").format(name))
+        if op not in ("in", "not_in") and str(clause.get("value") or "").strip() == "":
+            raise Incomplete(tr("Value missing for '{}'.").format(name))
+        return _datetime_sql(op, clause, f, fx, d)
 
     if op in ("in", "not_in"):
         vals = clause.get("values") or []
@@ -452,20 +685,28 @@ def clause_to_sql(clause, kind, d):
             raise Incomplete(tr("Choose at least one value for '{}'.").format(name))
         canon = [normalize_value(v, kind) for v in vals]
         if kind in ("text", "any", "other") and d == "ogrsql":
+            plain = [v for v in canon if not has_ascii_letters(v)]
+            lettered = [v for v in canon if has_ascii_letters(v)]
+            if len(lettered) > MAX_EXACT_LIST:
+                plain, lettered = canon, []
+            listed = ", ".join(_quote(v, d) for v in plain)
             if op == "in":
-                items = [_exact(f, v, d) for v in canon]
+                items = (["{} IN ({})".format(f, listed)] if plain else []) + [_exact(f, v, d) for v in lettered]
                 return items[0] if len(items) == 1 else "(" + " OR ".join(items) + ")"
-            items = [_exact(f, v, d, negate=True) for v in canon]
+            items = (["{} NOT IN ({})".format(f, listed)] if plain else []) + \
+                [_exact(f, v, d, negate=True) for v in lettered]
             return "(" + " AND ".join(items) + not_null + ")"
         lits = ", ".join(_lit(v, kind, d) for v in canon)
         if op == "in":
             return "{} IN ({})".format(fx, lits)
         return "({} NOT IN ({}){})".format(fx, lits, not_null)
 
-    if op == "between":
+    if op in ("between", "not_between"):
         a = _lit(normalize_value(clause.get("value"), kind), kind, d)
         b = _lit(normalize_value(clause.get("value2"), kind), kind, d)
-        return "({fx} >= {a} AND {fx} <= {b})".format(fx=fx, a=a, b=b)
+        if op == "between":
+            return "({fx} >= {a} AND {fx} <= {b})".format(fx=fx, a=a, b=b)
+        return "(({fx} < {a} OR {fx} > {b}){nn})".format(fx=fx, a=a, b=b, nn=not_null)
 
     if op in ("gt", "ge", "lt", "le") and kind in ("text", "bool", "other"):
         raise ClauseError(tr("«{}» does not work with this field type.").format(OP_BY_KEY[op][1]))
@@ -623,15 +864,20 @@ def _combine(terms):
     return " OR ".join(out), True
 
 
+# fields GDAL adds to every layer (e.g. «OGR_GEOM_AREA > 1000» works in a Shapefile)
+_OGR_SPECIAL_FIELDS = {"FID", "OGR_GEOMETRY", "OGR_GEOM_WKT", "OGR_GEOM_AREA", "OGR_STYLE"}
+
+
 def field_problems(layer, names):
     """Fields that cannot be used in a layer filter: missing ones and joined/virtual ones
     (QGIS filters at the data source, which does not know those fields). Returns (missing, foreign)."""
     fields = layer.fields()
     missing, foreign = [], []
+    special = _OGR_SPECIAL_FIELDS if dialect_of(layer) == "ogrsql" else {"FID"}
     for n in names:
         idx = fields.lookupField(n)
         if idx < 0:
-            if str(n).upper() != "FID" and not str(n).startswith("$"):
+            if str(n).upper() not in special and not str(n).startswith("$"):
                 missing.append(n)
             continue
         if not is_provider_field(layer, idx):
