@@ -1,5 +1,5 @@
 [general]
-name=Definition Queries
+name=Definition Queries (Layer Filters)
 qgisMinimumVersion=3.34
 qgisMaximumVersion=4.99
 description=Filter your layers without writing SQL: build filters with drop-downs, save several named filters per layer and switch between them in one click.
